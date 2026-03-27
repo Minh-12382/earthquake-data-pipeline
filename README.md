@@ -1,5 +1,7 @@
 ![Dashboard_earthquake_NOAA](https://github.com/user-attachments/assets/0172b9a0-bf6c-4c6a-93c3-2b34944e22ba)# 🌍 Global Earthquake Data Pipeline
 
+> Built an end-to-end automated data pipeline for global earthquake data using Python, MySQL, Power BI, and Airflow.
+
 ## 📌 Overview
 This project builds an end-to-end data pipeline to collect, process, and analyze global earthquake data from multiple reliable sources.
 
