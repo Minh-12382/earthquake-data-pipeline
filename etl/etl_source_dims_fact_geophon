@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+import os
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import pyodbc
+
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = BASE_DIR.parent
+SQL_DIR = BASE_DIR / "sql"
+RAW_DIR = PROJECT_DIR / "Raw Data"
+SOURCE_2000_2025 = RAW_DIR / "geophon_earthquakes_2000_2025.csv"
+SOURCE_2025_2026 = RAW_DIR / "geophon_earthquakes_2025_2026.csv"
+DEFAULT_INPUT = PROJECT_DIR / "Raw Data" / "geophon_earthquakes_2000_2026_merged.csv"
+REQUIRED_SQL_FILES = (
+    SQL_DIR / "01_create_source.sql",
+    SQL_DIR / "02_create_dims_fact.sql",
+    SQL_DIR / "03_load_dims_fact.sql",
+)
+
+
+def get_env(name: str, default: str | None = None) -> str:
+    value = os.getenv(name, default)
+    if value is None or value == "":
+        raise ValueError(f"Missing environment variable: {name}")
+    return value
+
+
+def split_sql_batches(sql_text: str) -> list[str]:
+    batches: list[str] = []
+    buf: list[str] = []
+    for line in sql_text.splitlines():
+        if line.strip().upper() == "GO":
+            chunk = "\n".join(buf).strip()
+            if chunk:
+                batches.append(chunk)
+            buf = []
+            continue
+        buf.append(line)
+    tail = "\n".join(buf).strip()
+    if tail:
+        batches.append(tail)
+    return batches
+
+
+def execute_sql_file(conn: pyodbc.Connection, sql_path: Path) -> None:
+    text = sql_path.read_text(encoding="utf-8-sig")
+    cur = conn.cursor()
+    for batch in split_sql_batches(text):
+        cur.execute(batch)
+    cur.close()
+
+
+def ensure_database(host: str, port: str, user: str, password: str, odbc_driver: str, database: str) -> None:
+    conn_str = (
+        f"DRIVER={{{odbc_driver}}};"
+        f"SERVER={host},{port};"
+        "DATABASE=master;"
+        f"UID={user};PWD={password};"
+        "Encrypt=no;"
+        "TrustServerCertificate=yes;"
+    )
+    with pyodbc.connect(conn_str, autocommit=True) as conn:
+        conn.execute(f"IF DB_ID(N'{database}') IS NULL EXEC ('CREATE DATABASE [{database}]');")
+
+
+def normalize_country_from_place(place: str) -> str:
+    p = (place or "").strip()
+    if not p:
+        return "Unknown"
+    if "," in p:
+        return p.split(",")[-1].strip() or "Unknown"
+    return p
+
+
+def to_date_text(time_text: str) -> str:
+    t = (time_text or "").strip()
+    if not t:
+        return t
+    if len(t) >= 10 and t[4] == '-' and t[7] == '-':
+        return t[:10]
+
+    # Normalize common non-ISO formats from source CSV to YYYY-MM-DD.
+    for fmt in ("%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(t, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return t
+
+
+def normalize_input_schema(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame()
+    out["event_id"] = (
+        df["event_id"] if "event_id" in df.columns else df.get("id", "")
+    )
+    out["time"] = (
+        df["time"] if "time" in df.columns else df.get("datetime", "")
+    )
+    out["magnitude"] = (
+        df["magnitude"] if "magnitude" in df.columns else df.get("mag", "")
+    )
+    out["place"] = (
+        df["place"]
+        if "place" in df.columns
+        else (df["dia_danh"] if "dia_danh" in df.columns else df.get("location", ""))
+    )
+    out["latitude"] = (
+        df["latitude"] if "latitude" in df.columns else df.get("lat", "")
+    )
+    out["longitude"] = (
+        df["longitude"] if "longitude" in df.columns else df.get("lon", "")
+    )
+    out["depth_km"] = (
+        df["depth_km"] if "depth_km" in df.columns else df.get("depth", "")
+    )
+    out["source"] = df["source"] if "source" in df.columns else "GEOPHON"
+
+    for col in out.columns:
+        out[col] = out[col].astype(str).str.strip()
+        out.loc[out[col].isin(["", "nan", "None", "null", "NaN"]), col] = ""
+
+    return out
+
+
+def build_merged_geophon_csv(source_a: Path, source_b: Path, output_csv: Path) -> int:
+    if not source_a.exists():
+        raise FileNotFoundError(f"Source CSV not found: {source_a}")
+    if not source_b.exists():
+        raise FileNotFoundError(f"Source CSV not found: {source_b}")
+
+    df_a = pd.read_csv(source_a, dtype=str, keep_default_na=False)
+    df_b = pd.read_csv(source_b, dtype=str, keep_default_na=False)
+    norm_a = normalize_input_schema(df_a)
+    norm_b = normalize_input_schema(df_b)
+
+    merged = pd.concat([norm_a, norm_b], ignore_index=True)
+    merged = merged[merged["event_id"].astype(str).str.strip() != ""].copy()
+    merged = merged.drop_duplicates(subset=["event_id"], keep="last")
+    merged.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    return int(len(merged))
+
+
+def load_raw_csv(conn: pyodbc.Connection, csv_path: Path) -> int:
+    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    required = ["event_id", "time", "magnitude", "place", "latitude", "longitude", "depth_km", "source"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Input CSV missing columns: {missing}")
+
+    load_df = pd.DataFrame()
+    load_df["event_id"] = df["event_id"].astype(str).str.strip()
+    load_df["time"] = df["time"].astype(str).map(to_date_text)
+    load_df["magnitude"] = df["magnitude"].astype(str).str.strip()
+    load_df["location"] = df["place"].astype(str).str.strip()
+    load_df["country"] = df["place"].astype(str).map(normalize_country_from_place)
+    load_df["latitude"] = df["latitude"].astype(str).str.strip()
+    load_df["longitude"] = df["longitude"].astype(str).str.strip()
+    load_df["depth_km"] = df["depth_km"].astype(str).str.strip()
+    load_df["source"] = df["source"].astype(str).str.strip()
+
+    rows = [tuple(None if (str(v).strip() == "" or str(v).lower() == "nan") else str(v).strip() for v in row)
+            for row in load_df.itertuples(index=False, name=None)]
+
+    sql = (
+        "INSERT INTO raw.earthquake_geo "
+        "(event_id, [time], magnitude, [location], country, latitude, longitude, depth_km, [source]) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    cur = conn.cursor()
+    cur.execute("DELETE FROM raw.earthquake_geo;")
+    if rows:
+        cur.fast_executemany = True
+        cur.executemany(sql, rows)
+    cur.close()
+    return len(rows)
+
+
+def validate_required_files(input_csv: Path) -> None:
+    if not input_csv.exists():
+        raise FileNotFoundError(f"Input CSV not found: {input_csv}")
+
+    missing_sql = [str(p) for p in REQUIRED_SQL_FILES if not p.exists()]
+    if missing_sql:
+        raise FileNotFoundError(f"Missing required SQL file(s): {missing_sql}")
+
+
+def main() -> None:
+    input_csv = Path(os.getenv("GEOPHON_INPUT_CSV", str(DEFAULT_INPUT))).resolve()
+    if input_csv == DEFAULT_INPUT.resolve():
+        merged_rows = build_merged_geophon_csv(SOURCE_2000_2025, SOURCE_2025_2026, input_csv)
+        print(f"Built merged CSV: {input_csv} | rows: {merged_rows}")
+
+    validate_required_files(input_csv)
+    print(f"Input CSV: {input_csv}")
+
+    host = get_env("MSSQL_HOST", "localhost")
+    port = get_env("MSSQL_PORT", "1433")
+    database = get_env("MSSQL_DATABASE", "dep305_exp2")
+    user = get_env("MSSQL_USER", "external_user")
+    password = get_env("MSSQL_PASSWORD", "StrongPassword_123")
+    odbc_driver = get_env("MSSQL_ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+
+    ensure_database(host, port, user, password, odbc_driver, database)
+
+    conn_str = (
+        f"DRIVER={{{odbc_driver}}};"
+        f"SERVER={host},{port};"
+        f"DATABASE={database};"
+        f"UID={user};PWD={password};"
+        "Encrypt=no;"
+        "TrustServerCertificate=yes;"
+    )
+
+    with pyodbc.connect(conn_str, autocommit=True) as conn:
+        execute_sql_file(conn, SQL_DIR / "01_create_source.sql")
+        execute_sql_file(conn, SQL_DIR / "02_create_dims_fact.sql")
+        loaded = load_raw_csv(conn, input_csv)
+        execute_sql_file(conn, SQL_DIR / "03_load_dims_fact.sql")
+
+        cur = conn.cursor()
+        tables = [
+            "raw.earthquake_geo",
+            "DW.dim_time_geo",
+            "DW.dim_magnitude_geo",
+            "DW.dim_country_geo",
+            "DW.dim_depth_geo",
+            "DW.fact_earthquake_geo",
+        ]
+        for t in tables:
+            cnt = cur.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            print(f"{t}: {cnt}")
+        cur.close()
+
+    print(f"Loaded rows: {loaded}")
+
+
+if __name__ == "__main__":
+    main()
