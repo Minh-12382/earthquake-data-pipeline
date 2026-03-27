@@ -5,7 +5,7 @@
 ---
 ## 📊 Dashboard
 
-!![Dashboard_earthquake_NOAA](https://github.com/user-attachments/assets/0172b9a0-bf6c-4c6a-93c3-2b34944e22ba)
+![Dashboard_earthquake_NOAA](https://github.com/user-attachments/assets/0172b9a0-bf6c-4c6a-93c3-2b34944e22ba)
 
 ## 📌 Overview
 This project builds an end-to-end data pipeline to collect, process, and analyze global earthquake data from multiple reliable sources.
